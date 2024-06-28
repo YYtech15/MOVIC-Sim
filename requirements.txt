@@ -3,3 +3,5 @@ tqdm
 pydicom
 nibabel
 matplotlib
+scipy
+pytest

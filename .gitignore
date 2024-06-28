@@ -2,3 +2,4 @@ env/
 dicom/
 output/
 roi/
+__pycache__/

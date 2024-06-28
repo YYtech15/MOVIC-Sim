@@ -8,118 +8,234 @@ import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from scipy.ndimage import affine_transform, zoom
+import glob
 
 def ensure_directory(directory):
+    """ディレクトリが存在しない場合は作成する"""
     if not os.path.exists(directory):
         os.makedirs(directory)
         print(f"Created directory: {directory}")
 
-def nifti_to_dicom(nifti_file, output_folder, organ_name):
-    # NIfTIファイルを読み込む
+def apply_affine_transform(image, affine, reference_affine):
+    """アフィン変換を適用して画像を共通の参照フレームに変換する"""
+    transform = np.linalg.inv(reference_affine).dot(affine)
+    return affine_transform(image, transform[:3, :3], offset=transform[:3, 3], order=1)
+
+def resize_volume(volume, target_shape):
+    """ボリュームを指定されたサイズにリサイズする"""
+    factors = [t / s for t, s in zip(target_shape, volume.shape)]
+    return zoom(volume, factors, order=1)
+
+def unify_orientation(nifti_img):
+    """NIfTIイメージの向きを統一する"""
+    return nib.as_closest_canonical(nifti_img)
+
+def create_dicom_dataset(organ_name, reference_affine, i, nifti_array, target_shape):
+    """DICOMデータセットを作成する"""
+    file_meta = Dataset()
+    file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+    ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+    # 必須のDICOMタグを設定
+    ds.PatientName = "Anonymous"
+    ds.PatientID = "123456"
+    ds.StudyInstanceUID = generate_uid()
+    ds.SeriesInstanceUID = generate_uid()
+    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
+    ds.Modality = "CT"
+    ds.SeriesDescription = f"{organ_name} Segmentation"
+    ds.SeriesNumber = 1
+    ds.InstanceNumber = i + 1
+
+    # 位置情報を設定（リサイズ後のサイズに合わせて調整）
+    position = reference_affine.dot(np.array([0, 0, i * (nifti_array.shape[2] / target_shape[2]), 1]))[:3]
+    ds.ImagePositionPatient = position.tolist()
+
+    # 画像の向きを設定（統一された向きを使用）
+    orientation = reference_affine[:3, :2].T.flatten().tolist()
+    ds.ImageOrientationPatient = orientation
+
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelRepresentation = 0
+    ds.HighBit = 15
+    ds.BitsStored = 16
+    ds.BitsAllocated = 16
+    ds.Columns = target_shape[0]
+    ds.Rows = target_shape[1]
+    
+    # ピクセルスペーシングを設定（リサイズ後のサイズに合わせて調整）
+    original_spacing = np.sqrt(np.sum(reference_affine[:3, :2]**2, axis=0))
+    pixel_spacing = original_spacing * (nifti_array.shape[:2] / np.array(target_shape[:2]))
+    ds.PixelSpacing = pixel_spacing.tolist()
+    ds.SliceThickness = np.abs(reference_affine[2, 2]) * (nifti_array.shape[2] / target_shape[2])
+
+    dt = datetime.datetime.now()
+    ds.ContentDate = dt.strftime('%Y%m%d')
+    ds.ContentTime = dt.strftime('%H%M%S.%f')
+
+    return ds
+
+def process_slice_data(slice_data):
+    """スライスデータの正規化と変換"""
+    slice_min = np.min(slice_data)
+    slice_max = np.max(slice_data)
+    if slice_max > slice_min:
+        slice_data = ((slice_data - slice_min) / (slice_max - slice_min) * 4095).astype(np.uint16)
+    else:
+        slice_data = np.zeros_like(slice_data, dtype=np.uint16)
+    return slice_data
+
+def nifti_to_dicom(nifti_file, output_folder):
+    # Load NIFTI file
     nifti = nib.load(nifti_file)
     nifti_array = nifti.get_fdata()
+    
+    # Resample to 512x512x970
+    target_shape = (512, 512, 970)
+    zoom_factors = np.array(target_shape) / np.array(nifti_array.shape)
+    nifti_array_resampled = zoom(nifti_array, zoom_factors, order=1)
+    
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
 
-    # 出力フォルダを作成
-    ensure_directory(output_folder)
+    # Extract patient information (you may need to customize this)
+    patient_name = "Anonymous"
+    patient_id = "12345"
+    
+    # Get current time for StudyDate and StudyTime
+    current_time = datetime.datetime.now()
+    study_date = current_time.strftime('%Y%m%d')
+    study_time = current_time.strftime('%H%M%S')
 
-    # NIfTIデータの各スライスをDICOMファイルとして保存
-    for i in tqdm(range(nifti_array.shape[2]), desc=f"Converting {organ_name} to DICOM"):
-        # DICOMデータセットを作成
+    # Define spacing and orientation (assuming default values, customize as needed)
+    pixel_spacing = [1.0, 1.0]
+    slice_thickness = 1.0
+    slice_spacing = 1.0  # Distance between slices
+
+    for i in tqdm(range(nifti_array_resampled.shape[2]), desc="Converting NIfTI to DICOM"):  # Assuming the third dimension is for slices
+        # Create a new DICOM file
         file_meta = Dataset()
-        file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
         file_meta.MediaStorageSOPInstanceUID = generate_uid()
+        # print(f"Generated UID for MediaStorageSOPInstanceUID: {file_meta.MediaStorageSOPInstanceUID}")
         file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
 
         ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
 
-        # 必須のDICOMタグを設定
-        ds.PatientName = "Anonymous"
-        ds.PatientID = "123456"
-        ds.StudyInstanceUID = generate_uid()
+        # Add the data elements
+        ds.PatientName = patient_name
+        ds.PatientID = patient_id
+        ds.Modality = "CT"  # Assuming CT, change if necessary
         ds.SeriesInstanceUID = generate_uid()
+        # print(f"Generated UID for SeriesInstanceUID: {ds.SeriesInstanceUID}")
+        ds.StudyInstanceUID = generate_uid()
+        # print(f"Generated UID for StudyInstanceUID: {ds.StudyInstanceUID}")
         ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
         ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
-        ds.Modality = "CT"
-        ds.SeriesDescription = f"{organ_name} Segmentation"
-        ds.SeriesNumber = 1
-        ds.InstanceNumber = i + 1
-        ds.ImagePositionPatient = r"0\0\%d" % i
-        ds.ImageOrientationPatient = r"1\0\0\0\1\0"
+
+        ds.StudyDate = study_date
+        ds.StudyTime = study_time
+        ds.AccessionNumber = ''
+        ds.InstanceCreationDate = study_date
+        ds.InstanceCreationTime = study_time
+
+        # Image specific information
         ds.SamplesPerPixel = 1
         ds.PhotometricInterpretation = "MONOCHROME2"
         ds.PixelRepresentation = 0
         ds.HighBit = 15
         ds.BitsStored = 16
         ds.BitsAllocated = 16
-        ds.Columns = nifti_array.shape[0]
-        ds.Rows = nifti_array.shape[1]
-        ds.PixelSpacing = r"1\1"
+        ds.Columns = 512
+        ds.Rows = 512
+        ds.InstanceNumber = i + 1
+        ds.ImagePositionPatient = [0, 0, i * slice_spacing]  # Customize as necessary
+        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]  # Assuming no rotation, customize as necessary
+        ds.PixelSpacing = pixel_spacing
+        ds.SliceThickness = slice_thickness
 
-        dt = datetime.datetime.now()
-        ds.ContentDate = dt.strftime('%Y%m%d')
-        ds.ContentTime = dt.strftime('%H%M%S.%f')
+        # Set pixel data
+        slice_data = nifti_array_resampled[:, :, i]
+        ds.PixelData = slice_data.astype(np.uint16).tobytes()
 
-        # ピクセルデータを設定
-        slice_data = nifti_array[:, :, i]
-        
-        # 0除算を避けるための処理を追加
-        slice_min = np.min(slice_data)
-        slice_max = np.max(slice_data)
-        if slice_max > slice_min:
-            slice_data = ((slice_data - slice_min) / (slice_max - slice_min) * 4095).astype(np.uint16)
-        else:
-            slice_data = np.zeros_like(slice_data, dtype=np.uint16)
-        
-        ds.PixelData = slice_data.tobytes()
+        # Save the DICOM file
+        ds.save_as(os.path.join(output_folder, f'slice_{i+1:04d}.dcm'))
 
-        # DICOMファイルを保存
-        ds.save_as(os.path.join(output_folder, f'{organ_name}_slice_{i:04d}.dcm'), write_like_original=False)
+    print(f"Conversion complete. DICOM files saved in {output_folder}")
 
-    print(f"Conversion complete for {organ_name}. DICOM files saved in {output_folder}")
-
-def combine_organ_data(dicom_folders, output_file):
+def combine_organ_data(dicom_folder_list, output_folder):
     combined_data = None
     organ_labels = {}
-    current_label = 1
+    
+    print("Starting combine_organ_data function")
+    print(f"DICOM folders: {dicom_folder_list}")
+    print(f"Output folder: {output_folder}")
 
-    for folder in tqdm(dicom_folders, desc="Combining organ data"):
-        organ_name = os.path.basename(folder).replace("_dicom", "")
-        dicom_files = [f for f in os.listdir(folder) if f.endswith('.dcm')]
-        dicom_files.sort()
-
-        organ_data = []
-        for file in tqdm(dicom_files, desc=f"Processing {organ_name} DICOM files", leave=False):
-            ds = pydicom.dcmread(os.path.join(folder, file))
-            organ_data.append(ds.pixel_array)
-
-        organ_data = np.stack(organ_data, axis=-1)
-
+    for label, folder in enumerate(dicom_folder_list, start=1):
+        organ = os.path.basename(folder).replace('_dicom', '')
+        print(f"Processing organ: {organ}")
+        if not os.path.exists(folder):
+            print(f"Warning: Folder for {organ} not found. Skipping...")
+            continue
+        
+        dicom_files = sorted(glob.glob(os.path.join(folder, '*.dcm')))
+        if not dicom_files:
+            print(f"Warning: No DICOM files found for {organ}. Skipping...")
+            continue
+        
+        print(f"Number of DICOM files for {organ}: {len(dicom_files)}")
+        
+        # Load the first DICOM file to get the image shape
+        ds = pydicom.dcmread(dicom_files[0])
+        shape = (ds.Rows, ds.Columns, len(dicom_files))
+        
+        print(f"Shape for {organ}: {shape}")
+        
+        # Initialize or update the combined data array
         if combined_data is None:
-            combined_data = np.zeros_like(organ_data)
-
-        # 各臓器に一意のラベルを割り当てる
-        combined_data[organ_data > 0] = current_label
-        organ_labels[organ_name] = current_label
-        current_label += 1
-
-    # 結合されたデータをNIfTIファイルとして保存
-    ensure_directory(os.path.dirname(output_file))
-    nifti_img = nib.Nifti1Image(combined_data, np.eye(4))
-    nib.save(nifti_img, output_file)
-
-    print(f"Combined voxel data saved as {output_file}")
+            combined_data = np.zeros(shape, dtype=np.float32)
+        
+        # Load and combine DICOM data
+        for i, file in enumerate(tqdm(dicom_files, desc=f"Processing {organ}")):
+            ds = pydicom.dcmread(file)
+            pixel_array = ds.pixel_array.astype(np.float32)
+            combined_data[:,:,i] = np.where(pixel_array > 0, label, combined_data[:,:,i])
+        
+        # Assign a unique label for each organ
+        organ_labels[organ] = label
+    
     print("Organ labels:", organ_labels)
-
+    
+    if combined_data is None:
+        print("Error: No data was combined. All folders might be empty or non-existent.")
+        return None, None
+    
+    print(f"Final combined data shape: {combined_data.shape}")
+    
+    # Create NIfTI image
+    nifti_img = nib.Nifti1Image(combined_data, np.eye(4))
+    
+    # Save NIfTI file
+    os.makedirs(output_folder, exist_ok=True)
+    output_file = os.path.join(output_folder, 'combined_organs.nii.gz')
+    nib.save(nifti_img, output_file)
+    
+    print(f"Combined NIfTI file saved to: {output_file}")
+    
     return combined_data, organ_labels
 
 def create_simulation_model(combined_data, organ_labels, output_file):
+    """シミュレーションモデルを作成する"""
     print("Creating simulation model...")
-    # ここでシミュレーションモデルを作成するコードを実装
-    # 例: 単純な密度マップを作成
     density_map = np.zeros_like(combined_data, dtype=float)
     
     for organ, label in tqdm(organ_labels.items(), desc="Assigning densities to organs"):
-        # 仮の密度値
         if organ == "bone":
             density = 1.9  # g/cm^3
         elif organ == "soft_tissue":
@@ -131,54 +247,96 @@ def create_simulation_model(combined_data, organ_labels, output_file):
 
         density_map[combined_data == label] = density
 
-    # 密度マップをファイルに保存（例：NPY形式）
     ensure_directory(os.path.dirname(output_file))
     np.save(output_file, density_map)
     print(f"Simulation model (density map) saved as {output_file}")
+    
+def visualize_dicom(dicom_folder, organ_name):
+    """指定されたフォルダ内のDICOMファイルを表示し、XY、YZ、ZX平面の断面を表示する"""
+    dicom_files = sorted([f for f in os.listdir(dicom_folder) if f.endswith('.dcm')])
+    
+    if not dicom_files:
+        print(f"No DICOM files found in {dicom_folder}")
+        return
+    
+    try:
+        # すべてのDICOMファイルを読み込み、3D配列を作成
+        volume = []
+        for file in tqdm(dicom_files, desc=f"Loading {organ_name} DICOM files"):
+            ds = pydicom.dcmread(os.path.join(dicom_folder, file))
+            volume.append(ds.pixel_array)
+        volume = np.array(volume)
+        
+        # 中央のスライスを選択
+        x_mid, y_mid, z_mid = [s // 2 for s in volume.shape]
+        
+        # 3つの平面の断面を取得
+        xy_plane = volume[z_mid]
+        yz_plane = volume[:, x_mid, :]
+        zx_plane = volume[:, :, y_mid].T
+        
+        # 画像を表示
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+        
+        ax1.imshow(xy_plane, cmap='gray')
+        ax1.set_title(f"{organ_name} - XY Plane (Z middle)")
+        ax1.set_xlabel('X')
+        ax1.set_ylabel('Y')
+        ax1.axis('on')
+        
+        ax2.imshow(yz_plane, cmap='gray')
+        ax2.set_title(f"{organ_name} - YZ Plane (X middle)")
+        ax2.set_xlabel('Z')
+        ax2.set_ylabel('Y')
+        ax2.axis('on')
+        
+        ax3.imshow(zx_plane, cmap='gray')
+        ax3.set_title(f"{organ_name} - ZX Plane (Y middle)")
+        ax3.set_xlabel('X')
+        ax3.set_ylabel('Z')
+        ax3.axis('on')
+        
+        plt.tight_layout()
+        plt.show()
+        
+    except Exception as e:
+        print(f"Error processing DICOM files: {e}")
 
 def visualize_cross_sections(combined_data, organ_labels, output_file):
+    """シミュレーションモデルの断面を視覚化する"""
     print("Visualizing cross-sections of the simulation model...")
     
-    # カラーマップの設定
     colors = ['red', 'green', 'blue', 'yellow', 'purple', 'cyan']
     color_map = {label: mcolors.to_rgba(colors[i % len(colors)], alpha=0.5) 
-                 for i, label in enumerate(organ_labels.values())}
-    
-    # 背景色（黒）を追加
+                 for i, (organ, label) in enumerate(organ_labels.items())}
     color_map[0] = (0, 0, 0, 1)  # 完全に不透明な黒
 
-    # カスタムカラーマップの作成
     cmap = mcolors.ListedColormap([color_map[key] for key in sorted(color_map.keys())])
     
-    # 断面の位置を決定（ここでは中央で切っています）
     x_mid = combined_data.shape[0] // 2
     y_mid = combined_data.shape[1] // 2
     z_mid = combined_data.shape[2] // 2
     
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
     
-    # XY平面 (Z軸に垂直な断面)
     xy_plane = combined_data[:, :, z_mid]
     ax1.imshow(xy_plane, cmap=cmap, interpolation='nearest')
     ax1.set_title('XY Plane (Z middle)')
     ax1.set_xlabel('X')
     ax1.set_ylabel('Y')
     
-    # YZ平面 (X軸に垂直な断面)
     yz_plane = combined_data[x_mid, :, :]
     ax2.imshow(yz_plane, cmap=cmap, interpolation='nearest')
     ax2.set_title('YZ Plane (X middle)')
     ax2.set_xlabel('Z')
     ax2.set_ylabel('Y')
     
-    # ZX平面 (Y軸に垂直な断面)
-    zx_plane = combined_data[:, y_mid, :]
+    zx_plane = combined_data[:, y_mid, :].T
     ax3.imshow(zx_plane, cmap=cmap, interpolation='nearest')
     ax3.set_title('ZX Plane (Y middle)')
     ax3.set_xlabel('X')
     ax3.set_ylabel('Z')
     
-    # 凡例の追加
     patches = [plt.Rectangle((0, 0), 1, 1, fc=color_map[label]) for organ, label in organ_labels.items()]
     plt.legend(patches, organ_labels.keys(), loc='center left', bbox_to_anchor=(1, 0.5))
     
@@ -187,29 +345,48 @@ def visualize_cross_sections(combined_data, organ_labels, output_file):
     print(f"Cross-sectional visualization saved as {output_file}")
     plt.close()
 
-# メイン処理
 def main():
-    # 各臓器のNIfTIファイルをDICOMに変換
-    organs = ["bone"]
-    roi_dir = "ROI"
-    ensure_directory(roi_dir)
+    print("Starting main function")
     
+    # NIfTIファイルの入力フォルダと出力フォルダを指定
+    input_folder = 'roi'
+    output_folder = 'output'
+    combined_output = os.path.join(output_folder, 'combined_organs.nii.gz')
+
+    print(f"Input folder: {input_folder}")
+    print(f"Output folder: {output_folder}")
+    print(f"Combined output: {combined_output}")
+
+    # 各臓器のNIfTIファイルを処理
+    organs = ['bone', 'lung']
+    dicom_folders = []
+
+    print("Processing organs:")
     for organ in organs:
-        nifti_file = os.path.join(roi_dir, f"{organ}.nii")  # .nii ファイルを処理
-        if not os.path.exists(nifti_file):
-            nifti_file = os.path.join(roi_dir, f"{organ}.nii.gz")  # .nii.gz ファイルも処理
-        
-        if not os.path.exists(nifti_file):
-            print(f"Warning: NIfTI file for {organ} not found. Skipping...")
-            continue
-        
-        output_folder = os.path.join("output", f"{organ}_dicom")
-        nifti_to_dicom(nifti_file, output_folder, organ)
+        nifti_file = os.path.join(input_folder, f'{organ}.nii')
+        if os.path.exists(nifti_file):
+            print(f"  Found NIfTI file for {organ}")
+            dicom_folder = os.path.join(output_folder, f'{organ}_dicom')
+            dicom_folders.append(dicom_folder)
+            nifti_to_dicom(nifti_file, dicom_folder)
+            
+            # 生成されたDICOMデータを表示
+            visualize_dicom(dicom_folder, organ)
+        else:
+            print(f"  Warning: NIfTI file for {organ} not found. Skipping...")
+
+    print(f"DICOM folders: {dicom_folders}")
+    print(f"Combined output folder: {combined_output}")
 
     # 各臓器のDICOMデータを結合
-    dicom_folders = [os.path.join("output", f"{organ}_dicom") for organ in organs if os.path.exists(os.path.join("output", f"{organ}_dicom"))]
-    combined_output = os.path.join("output", "combined_organs.nii.gz")
     combined_data, organ_labels = combine_organ_data(dicom_folders, combined_output)
+    
+    if combined_data is None or organ_labels is None:
+        print("Error: Failed to combine organ data. Exiting...")
+        return
+    
+    print("Combined data shape:", combined_data.shape)
+    print("Organ labels:", organ_labels)
 
     # シミュレーションモデルを作成
     simulation_output = os.path.join("output", "simulation_model.npy")
