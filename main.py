@@ -91,10 +91,18 @@ def process_slice_data(slice_data):
         slice_data = np.zeros_like(slice_data, dtype=np.uint16)
     return slice_data
 
-def nifti_to_dicom(nifti_file, output_folder):
+def nifti_to_dicom(nifti_file, output_folder, flip_x=False, flip_y=False, flip_z=False):
     # Load NIFTI file
     nifti = nib.load(nifti_file)
     nifti_array = nifti.get_fdata()
+    
+    # Flip the data along the specified axes if needed
+    if flip_x:
+        nifti_array = np.flip(nifti_array, axis=0)
+    if flip_y:
+        nifti_array = np.flip(nifti_array, axis=1)
+    if flip_z:
+        nifti_array = np.flip(nifti_array, axis=2)
     
     # Resample to 512x512x970
     target_shape = (512, 512, 970)
@@ -118,12 +126,11 @@ def nifti_to_dicom(nifti_file, output_folder):
     slice_thickness = 1.0
     slice_spacing = 1.0  # Distance between slices
 
-    for i in tqdm(range(nifti_array_resampled.shape[2]), desc="Converting NIfTI to DICOM"):  # Assuming the third dimension is for slices
+    for i in tqdm(range(nifti_array_resampled.shape[2]), desc="Converting NIfTI to DICOM"):
         # Create a new DICOM file
         file_meta = Dataset()
         file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
         file_meta.MediaStorageSOPInstanceUID = generate_uid()
-        # print(f"Generated UID for MediaStorageSOPInstanceUID: {file_meta.MediaStorageSOPInstanceUID}")
         file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
 
         ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
@@ -133,9 +140,7 @@ def nifti_to_dicom(nifti_file, output_folder):
         ds.PatientID = patient_id
         ds.Modality = "CT"  # Assuming CT, change if necessary
         ds.SeriesInstanceUID = generate_uid()
-        # print(f"Generated UID for SeriesInstanceUID: {ds.SeriesInstanceUID}")
         ds.StudyInstanceUID = generate_uid()
-        # print(f"Generated UID for StudyInstanceUID: {ds.StudyInstanceUID}")
         ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
         ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
 
@@ -155,8 +160,8 @@ def nifti_to_dicom(nifti_file, output_folder):
         ds.Columns = 512
         ds.Rows = 512
         ds.InstanceNumber = i + 1
-        ds.ImagePositionPatient = [0, 0, i * slice_spacing]  # Customize as necessary
-        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]  # Assuming no rotation, customize as necessary
+        ds.ImagePositionPatient = [0, 0, i * slice_spacing]
+        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
         ds.PixelSpacing = pixel_spacing
         ds.SliceThickness = slice_thickness
 
@@ -359,6 +364,10 @@ def main():
 
     # 各臓器のNIfTIファイルを処理
     organs = ['bone', 'lung']
+    flip_config = {
+        'bone': {'flip_x': True, 'flip_y': True, 'flip_z': True},
+        'lung': {'flip_x': False, 'flip_y': False, 'flip_z': False}
+    }
     dicom_folders = []
 
     print("Processing organs:")
@@ -368,7 +377,12 @@ def main():
             print(f"  Found NIfTI file for {organ}")
             dicom_folder = os.path.join(output_folder, f'{organ}_dicom')
             dicom_folders.append(dicom_folder)
-            nifti_to_dicom(nifti_file, dicom_folder)
+            
+            # 必要に応じて軸を反転
+            flip_x = flip_config[organ]['flip_x']
+            flip_y = flip_config[organ]['flip_y']
+            flip_z = flip_config[organ]['flip_z']
+            nifti_to_dicom(nifti_file, dicom_folder, flip_x=flip_x, flip_y=flip_y, flip_z=flip_z)
             
             # 生成されたDICOMデータを表示
             visualize_dicom(dicom_folder, organ)
